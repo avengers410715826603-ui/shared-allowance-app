@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import time
+import uuid
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
@@ -42,10 +44,9 @@ SHEET_HEADERS = [
 
 # Tesseract本体の場所（PATHが通っていなくても使えるようにする）
 TESSERACT_CANDIDATE_PATHS = [
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    "C:/Program Files/Tesseract-OCR/tesseract.exe",
+    "C:/Program Files (x86)/Tesseract-OCR/tesseract.exe",
 ]
-
 st.set_page_config(page_title="共同財布 お小遣い管理", page_icon="💰", layout="wide")
 
 
@@ -70,7 +71,8 @@ def get_gspread_client() -> gspread.Client:
     if not os.path.exists(CREDENTIALS_FILE):
         raise FileNotFoundError(
             f"{CREDENTIALS_FILE} が見つかりません。app.py と同じフォルダに置いてください。"
-            "\nまたは Streamlit Cloud では Secrets に gcp_service_account を設定してください。"
+            
+"または Streamlit Cloud では Secrets に gcp_service_account を設定してください。"
         )
 
     credentials = Credentials.from_service_account_file(
@@ -93,9 +95,10 @@ def get_worksheet():
     return worksheet
 
 
+@st.cache_data(ttl=10)
 def read_all_transactions() -> list[dict]:
     worksheet = get_worksheet()
-    records = worksheet.get_all_records(expected_headers=SHEET_HEADERS)
+    records = with_gsheet_retry(lambda: worksheet.get_all_records(expected_headers=SHEET_HEADERS))
 
     cleaned_records = []
     for row in records:
@@ -112,6 +115,23 @@ def read_all_transactions() -> list[dict]:
         cleaned_records.append(cleaned)
 
     return cleaned_records
+
+
+# =========================
+# Google Sheets 再試行
+# =========================
+def with_gsheet_retry(func, max_retries: int = 5, base_wait: float = 1.0):
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            last_error = e
+            if attempt == max_retries - 1:
+                break
+            sleep_sec = base_wait * (2 ** attempt)
+            time.sleep(sleep_sec)
+    raise last_error
 
 
 # =========================
@@ -515,18 +535,10 @@ def guess_date(text: str) -> Optional[date]:
 # =========================
 # Google Sheets 上の記録操作
 # =========================
-def get_next_transaction_id() -> int:
-    rows = read_all_transactions()
-    if not rows:
-        return 1
-
-    max_id = 0
-    for row in rows:
-        try:
-            max_id = max(max_id, int(row.get("id", 0) or 0))
-        except ValueError:
-            continue
-    return max_id + 1
+def generate_transaction_id() -> str:
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    short_uuid = uuid.uuid4().hex[:8]
+    return f"{timestamp}_{short_uuid}"
 
 
 def add_transaction(
@@ -539,27 +551,29 @@ def add_transaction(
     ocr_raw_text: str,
 ) -> None:
     worksheet = get_worksheet()
-    next_id = get_next_transaction_id()
-    worksheet.append_row(
-        [
-            next_id,
-            spend_date.isoformat(),
-            user_name,
-            amount,
-            memo,
-            source_type,
-            image_path or "",
-            ocr_raw_text,
-            datetime.now().isoformat(timespec="seconds"),
-        ],
-        value_input_option="USER_ENTERED",
+    new_id = generate_transaction_id()
+    with_gsheet_retry(
+        lambda: worksheet.append_row(
+            [
+                new_id,
+                spend_date.isoformat(),
+                user_name,
+                amount,
+                memo,
+                source_type,
+                image_path or "",
+                ocr_raw_text,
+                datetime.now().isoformat(timespec="seconds"),
+            ],
+            value_input_option="USER_ENTERED",
+        )
     )
     st.cache_data.clear()
 
 
 def delete_transaction(transaction_id: int) -> None:
     worksheet = get_worksheet()
-    rows = worksheet.get_all_values()
+    rows = with_gsheet_retry(lambda: worksheet.get_all_values())
 
     target_row_index = None
     image_path = ""
@@ -572,7 +586,7 @@ def delete_transaction(transaction_id: int) -> None:
             break
 
     if target_row_index is not None:
-        worksheet.delete_rows(target_row_index)
+        with_gsheet_retry(lambda: worksheet.delete_rows(target_row_index))
 
     if image_path and os.path.exists(image_path):
         try:
